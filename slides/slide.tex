@@ -1,0 +1,362 @@
+\documentclass{beamer}
+\usepackage{hyperref}
+\usepackage[russian]{babel}
+\usepackage{fontspec}
+
+\usepackage{latexsym,amsmath,xcolor,multicol,booktabs,calligra}
+\usepackage{graphicx,listings,stackengine}
+\usepackage{array}
+
+\setmainfont{Liberation Serif}
+\setsansfont{Liberation Sans}
+\setmonofont{Liberation Mono}
+
+\author{Камендов Максим, Морозов Даниил}
+\title{Линковка в C++: эволюция, нагрузка, экосистема}
+\subtitle{От Make до Cargo — как менялась сборка}
+\institute{C++ Семинар}
+\date{\today}
+\usepackage{CNU}
+\setbeamerfont{frame number}{family=\sffamily,size=\footnotesize}
+
+\AtBeginSection[]{}
+\AtBeginSubsection[]{}
+
+\definecolor{deepblue}{rgb}{0,0,0.5}
+\definecolor{deepred}{rgb}{0.6,0,0}
+\definecolor{deepgreen}{rgb}{0,0.5,0}
+\definecolor{halfgray}{gray}{0.55}
+\definecolor{barred}{rgb}{0.9,0.3,0.2}
+\definecolor{bargreen}{rgb}{0.2,0.6,0.2}
+
+\lstset{
+basicstyle=\ttfamily\small,
+keywordstyle=\bfseries\color{deepblue},
+emphstyle=\ttfamily\color{deepred},
+stringstyle=\color{deepgreen},
+breaklines=true,
+columns=fullflexible,
+numbers=left,
+numberstyle=\small\color{halfgray},
+rulesepcolor=\color{red!20!green!20!blue!20},
+frame=shadowbox,
+language=C++
+}
+
+\lstdefinelanguage{CMake}{
+morekeywords={cmake_minimum_required,project,add_executable,target_link_libraries,add_library,target_include_directories,find_package,PUBLIC,PRIVATE,INTERFACE},
+morecomment=[l]{\#},
+morestring=[b]"
+}
+
+\lstdefinelanguage{Make}{
+morecomment=[l]{\#},
+morestring=[b]"
+}
+
+\lstdefinelanguage{TOML}{
+morekeywords={package,dependencies,name,version,edition,build},
+morecomment=[l]{\#},
+morestring=[b]"
+}
+
+\newcommand{\progbar}[3]{%
+\textcolor{#2}{\rule{#1}{4pt}}%
+\hspace{2pt}%
+\textcolor{halfgray}{\scriptsize #3}}
+
+\begin{document}
+
+\begin{frame}
+\titlepage
+\end{frame}
+
+\begin{frame}{План}
+\tableofcontents
+\end{frame}
+
+\section{Часть 1: Линковка}
+
+\begin{frame}{Что на самом деле делает линкер}
+\begin{itemize}
+\item Линкер выполняет два принципиально разных прохода:
+\begin{enumerate}
+\item \textbf{Resolution} — сборка глобальной таблицы символов из всех объектных файлов.
+Сильный (strong) символ — определение. Слабый (weak) — может быть переопределён.
+\item \textbf{Relocation} — подстановка реальных адресов вместо временных меток
+(секция + смещение).
+\end{enumerate}
+\item Современные линкеры: \texttt{ld} (GNU), \texttt{lld} (LLVM), \texttt{mold}.
+\item Раздельная компиляция: каждый \texttt{.cpp} $\rightarrow$ \texttt{.o},
+потом всё склеивается в один образ.
+\end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]{Анатомия объектного файла (ELF)}
+\begin{itemize}
+\item Основные секции:
+\begin{itemize}
+\item \texttt{.text} — исполняемый код
+\item \texttt{.data} — инициализированные глобальные переменные
+\item \texttt{.bss} — неинициализированные глобальные переменные
+\item \texttt{.symtab} — таблица символов
+\item \texttt{.rela.text} — таблица релокаций для секции кода
+\end{itemize}
+\item Strong vs Weak: в C++ глобальная переменная — strong, inline-функция — weak.
+\item Диагностика:
+\end{itemize}
+\begin{lstlisting}
+$ nm a.out | head -5
+0000000000001129 T main
+0000000000001144 W _Z3addii
+                 U _ZNSolsEPFRSoS_E
+\end{lstlisting}
+\vspace{-0.3em}
+\texttt{T} = strong defined, \texttt{W} = weak defined, \texttt{U} = undefined.
+\end{frame}
+
+\begin{frame}{Статическая и динамическая линковка}
+\begin{itemize}
+\item \textbf{Статическая} (\texttt{.a}): линкер копирует нужные секции прямо в
+исполняемый файл. Больше размер, но нет runtime-зависимостей.
+\item \textbf{Динамическая} (\texttt{.so}, \texttt{.dll}, \texttt{.dylib}):
+линкер записывает только ссылку. Код загружается в память при запуске.
+\item PIC (Position-Independent Code): обязателен для \texttt{.so}.
+Позволяет загружать библиотеку по любому адресу без пересчёта релокаций.
+\item Runtime linker (\texttt{ld.so}): \texttt{LD\_LIBRARY\_PATH},
+\texttt{RPATH}, \texttt{RUNPATH}.
+\end{itemize}
+\end{frame}
+
+\section{Часть 2: Линкер в C и C++}
+
+\begin{frame}[fragile]{Name Mangling и ODR}
+\begin{itemize}
+\item C++ линкуется не как C: перегрузка функций, шаблоны, пространства имён
+требуют \textbf{name mangling} — кодирования полного типа в имя символа.
+\end{itemize}
+\begin{lstlisting}
+int add(int, int);         // _Z3addii
+double add(double, double);// _Z3adddd
+namespace ns {
+  void foo();              // _ZN2ns3fooEv
+}
+\end{lstlisting}
+\begin{itemize}
+\item \texttt{extern "C"} отключает mangling — единственный способ
+линковать C++ код с C-библиотеками.
+\item ODR: каждое определение должно быть уникально, но для inline-функций,
+шаблонов и \texttt{constexpr} сделано исключение — они порождают weak symbols.
+\item Итог: простая программа на C++ может породить в десятки раз больше символов,
+чем эквивалент на C.
+\end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]{Шаблоны, COMDAT и скрытый рост бинарника}
+\begin{itemize}
+\item Каждая инстанциация шаблона порождает weak symbol.
+\item Линкер видит десятки копий \texttt{std::vector<int>::push\_back}
+(по одной из каждого \texttt{.cpp}).
+\item \textbf{COMDAT folding}: линкер удаляет дубликаты, оставляя одну копию.
+Но сначала надо сгенерировать все копии, разложить их и сравнить.
+\end{itemize}
+\begin{lstlisting}
+// a.cpp, b.cpp, c.cpp — каждая порождает:
+void std::vector<int>::push_back(int&&);  // W sym
+\end{lstlisting}
+\begin{itemize}
+\item Header-only библиотеки (Boost, nlohmann/json) эксплуатируют COMDAT.
+Цена: рост времени компиляции и объёма .o файлов.
+\item LTO (Link-Time Optimization) компенсирует: линкер перекомбинирует
+код между единицами трансляции.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{C++20 Modules: попытка сломать архитектуру}
+\begin{itemize}
+\item Традиционная модель: \texttt{\#include} — текстовая вставка.
+Один и тот же заголовок парсится N раз в N единицах трансляции.
+\item Modules: \texttt{import} — уже не текст, а \textbf{BMI} (Binary Module Interface).
+Препроцессор не нужен, AST готов.
+\item С точки зрения линковки:
+\begin{itemize}
+\item Модуль компилируется один раз в BMI.
+\item Импортёр получает уже готовый AST.
+\item Меньше работы компилятору, но сборка становится жёстко
+упорядоченной — нужно скомпилировать модуль до импортёра.
+\end{itemize}
+\item Статус на 2026: GCC, Clang и MSVC поддерживают, но миграция
+существующих проектов идёт медленно. CMake уже умеет \texttt{target\_compile\_features(… MODULES)}.
+\end{itemize}
+\end{frame}
+
+\section{Часть 3: Экосистема сборки}
+
+\begin{frame}{От файлов к пакетам: три уровня абстракции}
+\begin{center}
+\small
+\begin{tabular}{p{2cm}p{3.5cm}p{3.5cm}}
+\toprule
+\textbf{Уровень} & \textbf{Сущность} & \textbf{Инструмент} \\
+\midrule
+Файловый & Отдельные \texttt{.cpp}/\texttt{.h} файлы, timestamps & Make, Ninja \\
+\midrule
+Целевой & Target (библиотека/приложение) с транзитивными
+свойствами & CMake, Meson, Bazel \\
+\midrule
+Пакетный & Пакет с версией, зависимостями и метаданными & Cargo, vcpkg, Conan \\
+\bottomrule
+\end{tabular}
+\end{center}
+\vspace{0.5em}
+Ключевой вопрос: \textbf{что должен знать разработчик}, чтобы добавить зависимость?
+\end{frame}
+
+\begin{frame}[fragile]{Make: DAG над файловой системой}
+\begin{itemize}
+\item Концепция 1977 года (Stuart Feldman, Bell Labs).
+\item Правило: «если цель старше зависимости — пересобрать».
+\item Плюсы: языковая независимость, полный контроль.
+\item Минусы: не знает про \texttt{\#include}, ручное описание графа,
+никакой кроссплатформенности.
+\end{itemize}
+\begin{lstlisting}[language=Make,numbers=none]
+app: main.o parser.o ; $(CXX) $^ -o $@
+main.o: main.cpp parser.h ; $(CXX) -c main.cpp
+# Добавили config.h в parser.h — нужно обновить строки!
+\end{lstlisting}
+Костыль: \texttt{gcc -MM} — внешний генератор зависимостей.
+\end{frame}
+
+\begin{frame}[fragile]{CMake: таргеты и транзитивные требования}
+\begin{itemize}
+\item CMake — генератор, а не сборочная система.
+\item Главное изобретение: \textbf{Target} — абстракция «единица сборки»,
+которая несёт с собой include-пути, флаги, зависимости.
+\item PUBLIC / PRIVATE / INTERFACE — модель распространения свойств.
+\item \texttt{find\_package}, \texttt{FetchContent} — встроенное управление
+зависимостями.
+\end{itemize}
+\begin{lstlisting}[language=CMake]
+add_library(network src/net.cpp include/net.h)
+target_include_directories(network PUBLIC include/)
+
+add_executable(server src/server.cpp)
+target_link_libraries(server PUBLIC network)
+# server автоматически получит -Iinclude
+\end{lstlisting}
+Цена: собственный язык с неочевидным синтаксисом.
+\end{frame}
+
+\begin{frame}[fragile]{Cargo: пакетный менеджер как сборочная система}
+\begin{itemize}
+\item Rust-экосистема: компилятор + линкер + пакетный менеджер = один бинарник.
+\item Convention over Configuration: имя пакета = имя крейта.
+\item Semver-резолвер: предотвращает конфликты транзитивных зависимостей.
+\end{itemize}
+\begin{lstlisting}[language=TOML,numbers=none]
+[package]
+name = "server"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+tokio = { version = "1", features = ["net"] }
+\end{lstlisting}
+\begin{itemize}
+\item \texttt{cargo build} — одна команда на всё.
+\item \texttt{build.rs} — кастомная логика на Rust вместо Make-шагов.
+\item Ограничение: только Rust. Для C++ — комбинировать с CMake/vcpkg.
+\end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]{Одна задача — три подхода}
+Задача: библиотека \texttt{greet} + приложение \texttt{hello}.
+
+\small
+\textbf{Make:}\qquad
+\lstinline[language=Make]|hello: main.o libgreet.a ; $(CXX) $^ -o $@|
+
+\textbf{CMake:}\qquad
+\lstinline[language=CMake]|target_link_libraries(hello greet)|
+
+\textbf{Cargo:}\qquad
+\lstinline[language=TOML]|greet = { path = "../greet" }|
+
+\normalsize
+Эволюция: от явной команды \texttt{ar rcs} до декларативной строки.
+Рост абстракции = уменьшение явного кода = меньше мест для ошибок.
+\end{frame}
+
+\section{Часть 4: Методология и результаты}
+
+% \begin{frame}{Метрики сравнения}
+% Методология: оцениваем каждый инструмент по 5 шкалам от 1 (плохо) до 5 (отлично).
+%
+% \medskip
+% \begin{enumerate}
+% \item \textbf{Абстракция} — насколько сущности инструмента соответствуют
+% логике проекта (файл vs пакет).
+% \item \textbf{Управление зависимостями} — как подключаются сторонние библиотеки.
+% \item \textbf{Кроссплатформенность} — работает ли на Windows, Linux, macOS.
+% \item \textbf{Диагностика} — насколько читаемы сообщения об ошибках.
+% \item \textbf{Порог входа} — время до первой осмысленной сборки.
+% \end{enumerate}
+% \end{frame}
+
+% \begin{frame}{Результаты сравнения}
+% \centering
+% \small
+% \begin{tabular}{p{2cm}p{1.8cm}p{1.8cm}p{1.8cm}}
+% \toprule
+% \textbf{Метрика} & \textbf{Make} & \textbf{CMake} & \textbf{Cargo} \\
+% \midrule
+% Абстракция & 2 (файлы) & 4 (таргеты) & 5 (пакеты) \\
+% \midrule
+% Зависимости & 1 (ручные) & 3 (Fetch) & 5 (crates.io) \\
+% \midrule
+% Платформы & 2 (POSIX) & 5 (генератор) & 4 (встроено) \\
+% \midrule
+% Диагностика & 3 (честный Make) & 2 (свой язык) & 5 (Rust-сообщения) \\
+% \midrule
+% Порог входа & 4 & 2 & 5 \\
+% \bottomrule
+% \end{tabular}
+%
+% \medskip
+% \textbf{Визуализация:}
+% \bigskip
+%
+% Make:~\progbar{2cm}{barred}{файлы}
+%
+% CMake:~\progbar{3.2cm}{deepblue}{таргеты}
+%
+% Cargo:~\progbar{4.5cm}{bargreen}{пакеты}
+%
+% \hfill \scriptsize Длина = (балл по шкале абстракции) $\times$ 1cm
+% \end{frame}
+
+\begin{frame}{Выводы}
+\begin{itemize}
+\item \textbf{Make}: DAG-модель пересборки, но без знаний о C++ —
+никаких транзитивных зависимостей или типов целей.
+\item \textbf{CMake}: таргеты с транзитивными свойствами —
+лучший компромисс для C++ сегодня. Минус: сложный синтаксис.
+\item \textbf{Cargo}: менеджер пакетов + компилятор + линкер
+в одном бинарнике. Минус: привязан к одному языку.
+% \item C++ платит исторический долг: \texttt{\#include}, ODR, нет
+% модульности. Modules (C++20) + vcpkg/Conan сокращают разрыв,
+% но инерция архитектуры огромна.
+% \item Правило: выбирай наивысший уровень абстракции, доступный
+% для твоего языка и инфраструктуры.
+\end{itemize}
+\end{frame}
+
+\section{Источники}
+
+\begin{frame}[allowframebreaks]{Источники}
+\nocite{iso_cpp_odr,cpp20_modules,gnu_make,cmake_docs,cargo_book,elf_spec,itanium_abi,mold_docs,gcc_lto}
+\bibliographystyle{unsrt}
+\bibliography{ref}
+\end{frame}
+
+\end{document}
